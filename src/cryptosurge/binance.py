@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import time
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 import pandas as pd
 import requests
@@ -114,7 +114,7 @@ def rank_by_quote_volume(symbols: list[str], session: requests.Session | None = 
 def daily_klines(symbol: str, start_ms: int = 0, session: requests.Session | None = None) -> pd.DataFrame:
     """All completed daily candles for one symbol from ``start_ms`` (default: listing day)."""
     rows, cursor = [], start_ms
-    now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+    now_ms = int(datetime.now(UTC).timestamp() * 1000)
     while True:
         batch = _get(
             "/api/v3/klines",

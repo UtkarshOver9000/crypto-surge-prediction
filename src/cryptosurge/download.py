@@ -13,7 +13,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pandas as pd
@@ -42,7 +42,7 @@ def main() -> None:
     parser.add_argument("--min-days", type=int, default=730)
     args = parser.parse_args()
 
-    fetched_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    fetched_at = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
     symbols, prices = build_universe(args.top, args.min_days)
     args.out.mkdir(parents=True, exist_ok=True)
     path = args.out / PRICES_FILE

@@ -12,7 +12,7 @@ from __future__ import annotations
 import json
 import os
 import time
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from functools import lru_cache
 from pathlib import Path
 from typing import Any
@@ -111,7 +111,7 @@ def scan(top: int = Query(20, ge=1, le=100), refresh: bool = False) -> dict[str,
         _scan_cache.update(
             at=now,
             payload={
-                "fetched_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                "fetched_at": datetime.now(UTC).isoformat(timespec="seconds"),
                 "threshold": card["threshold"],
                 "coins_scored": len(results),
                 "results": results,
