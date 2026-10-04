@@ -1,203 +1,122 @@
 """
-FastAPI service for live scoring.
+FastAPI service: live surge scan of the coin universe.
+
+The models are trained offline (``python -m cryptosurge.train``) and loaded from
+``src/cryptosurge/artifacts``. ``/v1/scan`` downloads the last 150 daily
+candles of every coin from Binance's public API, rebuilds the same features
+used in training, and scores the most recent completed day.
 """
 
 from __future__ import annotations
 
+import json
 import os
+import time
+from datetime import datetime, timezone
+from functools import lru_cache
 from pathlib import Path
-from typing import Any, List
+from typing import Any
 
 import joblib
-import pandas as pd
-from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel, Field
+from fastapi import FastAPI, HTTPException, Query
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse, HTMLResponse
 
-from .features import FEATURE_COLS, SURGE_HORIZON_DAYS, SURGE_THRESHOLD, build_features
-from .live import predict_live
+from . import __version__
+from .binance import DAY_MS, many_daily_klines
+from .features import FEATURE_COLS, build_features
 
+ARTIFACT_DIR = Path(__file__).resolve().parent / "artifacts"
+DASHBOARD = Path(__file__).resolve().parent / "dashboard" / "index.html"
+LOOKBACK_DAYS = 150
+CACHE_SECONDS = int(os.getenv("SCAN_CACHE_SECONDS", "1800"))
 
-class Candle(BaseModel):
-    date: str = Field(..., description="YYYY-MM-DD")
-    coin_id: str
-    price: float
-    volume: float
-    market_cap: float
+app = FastAPI(
+    title="Crypto Surge Scanner",
+    description=(
+        "Probability that each of 100 Binance USDT pairs closes at least 15% higher in 7 days, from a model "
+        "trained on the full daily history of those coins. Research tool, not financial advice."
+    ),
+    version=__version__,
+    license_info={"name": "MIT"},
+)
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["GET"], allow_headers=["*"])
 
-
-class PredictRequest(BaseModel):
-    rows: List[Candle]
-    horizon: int | None = None
-    surge_threshold: float | None = None
-    top_k: float | None = Field(
-        default=None, description="If set, keep only top-k probability fraction"
-    )
-
-
-class PredictResponse(BaseModel):
-    count: int
-    results: list[dict[str, Any]]
+_scan_cache: dict[str, Any] = {"at": 0.0, "payload": None}
 
 
-app = FastAPI(title="Crypto Surge API", version="0.1.0")
-
-_BUNDLE: dict | None = None
-
-
-def _load_bundle(model_dir: Path) -> dict:
-    bundle_path = model_dir / "model_bundle.joblib"
-    if bundle_path.exists():
-        return joblib.load(bundle_path)
-    clf_path = model_dir / "surge_classifier.joblib"
-    reg_path = model_dir / "return_regressor.joblib"
-    if not clf_path.exists() or not reg_path.exists():
-        raise FileNotFoundError(
-            "Model files not found. Expected model_bundle.joblib or "
-            "surge_classifier.joblib + return_regressor.joblib."
-        )
-    return {
-        "classifier": joblib.load(clf_path),
-        "regressor": joblib.load(reg_path),
-        "metadata": {"feature_cols": FEATURE_COLS, "horizon": SURGE_HORIZON_DAYS},
-        "metrics": {"threshold": 0.5},
-    }
+@lru_cache(maxsize=1)
+def load_artifacts() -> tuple[dict, dict]:
+    models = joblib.load(ARTIFACT_DIR / "models.joblib")
+    card = json.loads((ARTIFACT_DIR / "model_card.json").read_text())
+    return models, card
 
 
-def _get_bundle() -> dict:
-    global _BUNDLE
-    if _BUNDLE is not None:
-        return _BUNDLE
-    model_dir = Path(os.getenv("MODEL_DIR", "models"))
-    _BUNDLE = _load_bundle(model_dir)
-    return _BUNDLE
-
-
-def _score(df: pd.DataFrame, horizon: int, surge_threshold: float) -> pd.DataFrame:
-    bundle = _get_bundle()
-    feature_cols = bundle["metadata"]["feature_cols"]
-    threshold = bundle.get("metrics", {}).get("threshold", 0.5)
-
-    if not set(feature_cols).issubset(df.columns):
-        required = {"date", "coin_id", "price", "volume", "market_cap"}
-        if not required.issubset(df.columns):
-            missing = sorted(required - set(df.columns))
-            raise ValueError("Missing required columns: " + ", ".join(missing))
-        df = build_features(
-            df,
-            horizon=horizon,
-            surge_threshold=surge_threshold,
-            include_labels=False,
-        )
-
-    if df.empty:
-        raise ValueError("Not enough history to build features.")
-
-    x = df[feature_cols]
-    df = df.copy()
-    df["surge_probability"] = bundle["classifier"].predict_proba(x)[:, 1]
-    df["surge_signal"] = (df["surge_probability"] >= threshold).astype(int)
-    df[f"predicted_{horizon}d_return"] = bundle["regressor"].predict(x)
-    return df
-
-
-def _to_results(df: pd.DataFrame, horizon: int) -> list[dict[str, Any]]:
-    cols = [
-        "date",
-        "coin_id",
-        "surge_probability",
-        "surge_signal",
-        f"predicted_{horizon}d_return",
+def score_latest(prices) -> list[dict]:
+    """Score the most recent date in ``prices`` (raw daily candles for the universe)."""
+    models, card = load_artifacts()
+    feats = build_features(prices, include_labels=False)
+    latest = feats[feats["date"] == feats["date"].max()].copy()
+    x = latest[FEATURE_COLS]
+    latest["surge_probability"] = models["classifier"].predict_proba(x)[:, 1]
+    latest["predicted_7d_return"] = models["regressor"].predict(x)
+    latest = latest.sort_values("surge_probability", ascending=False)
+    return [
+        {
+            "symbol": r.symbol,
+            "as_of": str(r.date.date()),
+            "close": float(r.close),
+            "surge_probability": round(float(r.surge_probability), 4),
+            "signal": bool(r.surge_probability >= card["threshold"]),
+            "predicted_7d_return": round(float(r.predicted_7d_return), 4),
+            "return_last_7d": round(float(r.ret_7d), 4),
+        }
+        for r in latest.itertuples()
     ]
-    out = df[cols].copy()
-    out["date"] = out["date"].astype(str)
-    return out.to_dict(orient="records")
 
 
-@app.get("/health")
+@app.get("/", response_class=HTMLResponse, include_in_schema=False)
+def dashboard():
+    if DASHBOARD.exists():
+        return FileResponse(str(DASHBOARD), media_type="text/html")
+    return HTMLResponse("<h1>Crypto Surge Scanner</h1><p>See <a href='/docs'>/docs</a></p>")
+
+
+@app.get("/v1/health", include_in_schema=False)
 def health() -> dict[str, str]:
     return {"status": "ok"}
 
 
-@app.get("/")
-def root() -> dict[str, str]:
-    return {
-        "service": "crypto-surge",
-        "status": "ok",
-        "docs": "/docs",
-        "health": "/health",
-    }
+@app.get("/v1/stats", tags=["Model"])
+def stats() -> dict[str, Any]:
+    """Held-out test metrics and backtest of the deployed model."""
+    _, card = load_artifacts()
+    return {k: v for k, v in card.items() if k not in ("symbols", "features")} | {"coins": len(card["symbols"])}
 
 
-@app.post("/predict", response_model=PredictResponse)
-def predict(req: PredictRequest) -> PredictResponse:
-    if not req.rows:
-        raise HTTPException(status_code=400, detail="rows must not be empty")
-
-    df = pd.DataFrame([row.model_dump() for row in req.rows])
-    horizon = req.horizon or SURGE_HORIZON_DAYS
-    surge_threshold = req.surge_threshold or SURGE_THRESHOLD
-
-    try:
-        scored = _score(df, horizon=horizon, surge_threshold=surge_threshold)
-    except Exception as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-
-    if req.top_k:
-        k = max(1, int(len(scored) * req.top_k))
-        scored = scored.sort_values("surge_probability", ascending=False).head(k)
-
-    results = _to_results(scored, horizon=horizon)
-    return PredictResponse(count=len(results), results=results)
-
-
-@app.post("/alerts", response_model=PredictResponse)
-def alerts(req: PredictRequest) -> PredictResponse:
-    if not req.rows:
-        raise HTTPException(status_code=400, detail="rows must not be empty")
-
-    df = pd.DataFrame([row.model_dump() for row in req.rows])
-    horizon = req.horizon or SURGE_HORIZON_DAYS
-    surge_threshold = req.surge_threshold or SURGE_THRESHOLD
-
-    try:
-        scored = _score(df, horizon=horizon, surge_threshold=surge_threshold)
-    except Exception as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-
-    scored = scored[scored["surge_signal"] == 1]
-    if req.top_k:
-        k = max(1, int(len(scored) * req.top_k))
-        scored = scored.sort_values("surge_probability", ascending=False).head(k)
-
-    results = _to_results(scored, horizon=horizon)
-    return PredictResponse(count=len(results), results=results)
-
-
-@app.get("/surge")
-def live_surge(
-    coin_id: str,
-    vs_currency: str = "usd",
-    horizon: int = 1,
-    days: int = 365,
-    surge_threshold: float = SURGE_THRESHOLD,
-    refresh: bool = False,
-) -> dict[str, Any]:
-    try:
-        return predict_live(
-            coin_id=coin_id,
-            vs_currency=vs_currency,
-            days=days,
-            horizon=horizon,
-            surge_threshold=surge_threshold,
-            refresh=refresh,
+@app.get("/v1/scan", tags=["Live"])
+def scan(top: int = Query(20, ge=1, le=100), refresh: bool = False) -> dict[str, Any]:
+    """Live scan: every coin's surge probability for the latest completed daily candle."""
+    now = time.time()
+    if refresh or _scan_cache["payload"] is None or now - _scan_cache["at"] > CACHE_SECONDS:
+        _, card = load_artifacts()
+        start_ms = int((now * 1000) - LOOKBACK_DAYS * DAY_MS)
+        try:
+            prices = many_daily_klines(card["symbols"], start_ms=start_ms)
+        except RuntimeError as exc:
+            raise HTTPException(status_code=502, detail=f"Binance data unavailable: {exc}") from exc
+        if prices.empty:
+            raise HTTPException(status_code=502, detail="Binance returned no candles")
+        results = score_latest(prices)
+        _scan_cache.update(
+            at=now,
+            payload={
+                "fetched_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                "threshold": card["threshold"],
+                "coins_scored": len(results),
+                "results": results,
+            },
         )
-    except Exception as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-
-
-def main() -> None:
-    import uvicorn
-
-    host = os.getenv("HOST", "0.0.0.0")
-    port = int(os.getenv("PORT", "8000"))
-    uvicorn.run("cryptosurge.api:app", host=host, port=port, reload=False)
+    payload = dict(_scan_cache["payload"])
+    payload["results"] = payload["results"][:top]
+    return payload

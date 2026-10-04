@@ -3,6 +3,5 @@
 __pycache__
 .pytest_cache
 data
-*.csv
-*.joblib
-*.log
+reports
+tests

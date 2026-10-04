@@ -1,0 +1,96 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Crypto Surge Scanner</title>
+<style>
+  :root { --bg:#0b1020; --panel:#121a2e; --border:#22304d; --text:#eef2ff; --dim:#9aa7c7; --muted:#64708f;
+          --green:#22c55e; --amber:#f59e0b; --red:#ef4444; --accent:#60a5fa; --mono: Consolas, 'JetBrains Mono', monospace; }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: 'Segoe UI', system-ui, sans-serif; background: var(--bg); color: var(--text); padding: 28px 16px 60px; font-size: 14px; }
+  .wrap { max-width: 1000px; margin: 0 auto; }
+  h1 { font-size: 20px; } .sub { color: var(--dim); font-size: 13.5px; margin: 4px 0 20px; max-width: 760px; }
+  .tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); gap: 12px; margin-bottom: 22px; }
+  .tile { background: var(--panel); border: 1px solid var(--border); border-radius: 8px; padding: 12px 14px; }
+  .label { font-size: 10.5px; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); }
+  .value { font-size: 20px; font-weight: 700; } .note { font-size: 11.5px; color: var(--dim); }
+  .panel { background: var(--panel); border: 1px solid var(--border); border-radius: 8px; padding: 16px; overflow-x: auto; }
+  table { width: 100%; border-collapse: collapse; font-family: var(--mono); font-size: 12.5px; }
+  th, td { text-align: right; padding: 7px 8px; border-bottom: 1px solid var(--border); white-space: nowrap; }
+  th:first-child, td:first-child { text-align: left; } th { color: var(--muted); font-weight: 600; }
+  .sig { color: var(--green); font-weight: 700; } .pos { color: var(--green); } .neg { color: var(--red); }
+  .bar { display: inline-block; height: 8px; background: var(--accent); border-radius: 4px; vertical-align: middle; margin-right: 6px; }
+  .status { color: var(--dim); font-size: 12.5px; margin-bottom: 10px; } .err { color: var(--red); }
+  footer { color: var(--muted); font-size: 12px; margin-top: 24px; } footer a { color: var(--accent); text-decoration: none; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>Crypto Surge Scanner</h1>
+  <p class="sub">Probability that each coin closes at least 15% higher 7 days from now, scored live from Binance
+    daily candles by a model trained on the full daily history of 100 USDT pairs. Metrics below are from a
+    held-out period the model never saw. Research tool, not financial advice.</p>
+
+  <div class="tiles">
+    <div class="tile"><div class="label">Test ROC-AUC</div><div class="value" id="t-auc">—</div><div class="note" id="t-period">held-out period</div></div>
+    <div class="tile"><div class="label">Test precision / recall</div><div class="value" id="t-pr">—</div><div class="note" id="t-base">at threshold</div></div>
+    <div class="tile"><div class="label">Backtest (after fees)</div><div class="value" id="t-bt">—</div><div class="note" id="t-bt-note">vs BTC buy and hold</div></div>
+    <div class="tile"><div class="label">Backtest max drawdown</div><div class="value" id="t-dd">—</div><div class="note">surge strategy</div></div>
+  </div>
+
+  <div class="panel">
+    <div class="status" id="status">Loading live scan from Binance…</div>
+    <table>
+      <thead><tr><th>Coin</th><th>Surge probability</th><th>Signal</th><th>Predicted 7d return</th><th>Last 7d return</th><th>Close (USDT)</th></tr></thead>
+      <tbody id="rows"></tbody>
+    </table>
+  </div>
+
+  <footer><a href="/docs">API docs</a> · <a href="/v1/stats">Raw metrics</a> ·
+    <a href="https://github.com/UtkarshOver9000/crypto-surge-prediction">Source on GitHub</a></footer>
+</div>
+<script>
+const pct = (v, d = 1) => (v * 100).toFixed(d) + "%";
+const cls = v => v >= 0 ? "pos" : "neg";
+async function stats() {
+  try {
+    const s = await (await fetch("/v1/stats")).json();
+    document.getElementById("t-auc").textContent = s.test_metrics.roc_auc.toFixed(3);
+    document.getElementById("t-period").textContent = `held-out ${s.test_period[0]} → ${s.test_period[1]}`;
+    document.getElementById("t-pr").textContent = pct(s.test_metrics.precision, 0) + " / " + pct(s.test_metrics.recall, 0);
+    document.getElementById("t-base").textContent = `surge base rate ${pct(s.test_metrics.base_rate)}`;
+    document.getElementById("t-bt").textContent = pct(s.backtest.strategy.total_return, 0);
+    document.getElementById("t-bt-note").textContent = `BTC buy and hold: ${pct(s.backtest.btc_buy_and_hold.total_return, 0)}`;
+    document.getElementById("t-dd").textContent = pct(s.backtest.strategy.max_drawdown, 0);
+  } catch (e) { /* placeholders stay */ }
+}
+async function scan() {
+  const status = document.getElementById("status");
+  try {
+    const res = await fetch("/v1/scan?top=30");
+    const d = await res.json();
+    if (!res.ok) throw new Error(d.detail || res.statusText);
+    status.textContent = `Scored ${d.coins_scored} coins on the daily candle of ${d.results[0].as_of} (UTC). Fetched ${d.fetched_at}. Signal threshold ${d.threshold.toFixed(3)}. Top 30 shown.`;
+    const body = document.getElementById("rows");
+    body.replaceChildren(...d.results.map(r => {
+      const tr = document.createElement("tr");
+      const cells = [
+        r.symbol.replace("USDT", ""),
+        `<span class="bar" style="width:${Math.round(r.surge_probability * 120)}px"></span>${pct(r.surge_probability)}`,
+        r.signal ? '<span class="sig">BUY SIGNAL</span>' : "—",
+        `<span class="${cls(r.predicted_7d_return)}">${pct(r.predicted_7d_return)}</span>`,
+        `<span class="${cls(r.return_last_7d)}">${pct(r.return_last_7d)}</span>`,
+        r.close.toPrecision(6),
+      ];
+      tr.innerHTML = cells.map(c => `<td>${c}</td>`).join("");
+      return tr;
+    }));
+  } catch (e) {
+    status.innerHTML = `<span class="err">Live scan failed: ${String(e.message).replace(/</g, "&lt;")}</span>`;
+  }
+}
+stats(); scan();
+</script>
+</body>
+</html>
